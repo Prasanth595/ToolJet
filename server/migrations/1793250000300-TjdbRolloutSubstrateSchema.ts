@@ -1,24 +1,43 @@
+// migration-lint: allow-destructive the unique indexes are on new tables, or replace a constraint with a looser partial one
 import { MigrationInterface, QueryRunner, Table, TableColumn, TableForeignKey, TableUnique } from 'typeorm';
 
-// Pure-DDL half of "Migration A" (`data-migrations/1787564882760-TjdbRolloutMigrationASubstrate.ts`),
+// Pure-DDL half of "Migration A" (`data-migrations/1793250000800-TjdbRolloutMigrationASubstrate.ts`),
 // split out so the 3 new tables + internal_tables shape changes exist even on a deploy that skips
 // `db:migrate:data`. The data migration backfills relations/baselines into what this creates.
 //
 // Revert order matters and isn't enforced mechanically (both the schema and data datasources write
 // to the same `migrations` table, and TypeORM reverts by insertion id, not timestamp):
-//   TjdbRolloutMigrationBEnvironmentAssignment1788252587903 (down)
-//   -> TjdbRolloutMigrationASubstrate1787564882760 (down)
+//   TjdbRolloutMigrationBEnvironmentAssignment1793250001100 (down)
+//   -> TjdbRolloutMigrationASubstrate1793250000800 (down)
 //   -> this migration (down)
 // See src/modules/tooljet-db/AGENTS.md for the environments data model this substrate supports.
-export class TjdbRolloutSubstrateSchema1787564882000 implements MigrationInterface {
+export class TjdbRolloutSubstrateSchema1793250000300 implements MigrationInterface {
   public async up(queryRunner: QueryRunner): Promise<void> {
-    await this.createRelationsTable(queryRunner);
-    await this.createMigrationsTable(queryRunner);
-    await this.createMigrationApplicationsTable(queryRunner);
-    await this.addSoftDeleteToInternalTables(queryRunner);
+    // Test databases ran this under an earlier timestamp and run it again under this one. Each step
+    // creates a table or column with everything that hangs off it in the same transaction, so its
+    // presence means the step is done.
+    if (!(await queryRunner.hasTable('internal_table_relations'))) await this.createRelationsTable(queryRunner);
+    if (!(await queryRunner.hasTable('internal_table_migrations'))) await this.createMigrationsTable(queryRunner);
+    if (!(await queryRunner.hasTable('internal_table_migration_applications'))) {
+      await this.createMigrationApplicationsTable(queryRunner);
+    }
+    if (!(await queryRunner.hasColumn('internal_tables', 'deleted_at'))) {
+      await this.addSoftDeleteToInternalTables(queryRunner);
+    }
+    // An earlier revision of Migration A dropped this column on test databases; Migration A reads it.
+    await queryRunner.query(`ALTER TABLE internal_tables ADD COLUMN IF NOT EXISTS configurations jsonb`);
+    // Here, not in Migration A: the ALTER takes an ACCESS EXCLUSIVE lock, which in the data phase would
+    // block every ToolJet Database read until the phase commits. The previous release creates tables
+    // without a co_relation_id; the default gives them one. Migration A fills the existing NULLs.
+    await queryRunner.query(`ALTER TABLE internal_tables ALTER COLUMN co_relation_id SET DEFAULT gen_random_uuid()`);
   }
 
   public async down(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.query(`ALTER TABLE internal_tables ALTER COLUMN co_relation_id DROP DEFAULT`);
+    // drop_table soft-deletes the row and drops its physical tables. Without deleted_at the row
+    // would come back as a table with nothing behind it, and a name reused after the delete would
+    // break the unique constraint restored below. Relations and migrations cascade.
+    await queryRunner.query(`DELETE FROM internal_tables WHERE deleted_at IS NOT NULL`);
     await queryRunner.query(`DROP INDEX IF EXISTS organization_id_table_name_unique`);
     await queryRunner.dropColumn('internal_tables', 'deleted_at');
     await queryRunner.createUniqueConstraint(
@@ -212,10 +231,8 @@ export class TjdbRolloutSubstrateSchema1787564882000 implements MigrationInterfa
       'internal_tables',
       new TableColumn({ name: 'deleted_at', type: 'timestamp', isNullable: true })
     );
-    // Partial unique index instead of the plain constraint: once something starts soft-deleting
-    // tables (setting deleted_at), a deleted table's name must be free for reuse. No read site of
-    // internal_tables changes here — deleted_at is never set today, so every row's predicate is
-    // trivially true and behavior is unchanged.
+    // Partial unique index instead of the plain constraint: drop_table soft-deletes (sets
+    // deleted_at), and a deleted table's name must be free for reuse.
     // No IF EXISTS: migrationsTransactionMode: 'all' rolls back everything above on any failure,
     // so a retry always starts with the original constraint still present.
     await queryRunner.query(`ALTER TABLE internal_tables DROP CONSTRAINT organization_id_table_name_unique`);
