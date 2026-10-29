@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useId, useRef, useState } from 'react';
 import Slider from 'rc-slider';
 import 'rc-slider/assets/index.css';
 import { OverlayTrigger, Tooltip } from 'react-bootstrap';
@@ -24,8 +24,18 @@ export const RangeSliderV2 = ({
   id,
 }) => {
   const isInitialRender = useRef(true);
+  // Per mounted instance, not per component id: ListView gives every row the same component
+  // id, so an id derived from it alone collides across rows and names every handle after the first.
+  const reactId = useId();
+  const labelElementId = `${reactId}-label`;
   const labelRef = useRef(null);
   const { value, min, max, enableTwoHandle, label, schema, endValue, startValue, stepSize } = properties;
+
+  // `stripPercent` is deliberately NOT in the widget config:
+  // a data migration writes it onto components that already existed,
+  // so nothing shows in the inspector and a newly dropped slider never carries it.
+  // Present means "render marks the pre-fix way".
+  const stripPercent = properties.stripPercent;
 
   const {
     trackColor,
@@ -61,14 +71,21 @@ export const RangeSliderV2 = ({
   const singleHandleValue = !enableTwoHandle ? (Array.isArray(value) ? value[0] : value) : 50;
   const twoHandlesArray = enableTwoHandle ? toArray(value) : [0, 100];
 
+  // Only clamp against bounds that actually bound something.
+  // min/max are usually bound expressions, and a transient non-number or inverted pair
+  // during load would otherwise collapse a live value to NaN or to a floor it never had
+  // and it would never come back once the binding resolved.
+  const hasUsableBounds = Number.isFinite(min) && Number.isFinite(max) && max > min;
+  const clampToBounds = (v) => (hasUsableBounds && typeof v === 'number' ? Math.min(Math.max(v, min), max) : v);
+
   const resetFn = async () => {
     let defaultValue;
     if (enableTwoHandle === 'slider') {
-      defaultValue = value ?? min;
+      defaultValue = clampToBounds(value ?? min);
       setDefaultSliderValue(defaultValue);
     } else {
-      const start = startValue ?? min;
-      const end = endValue ?? max;
+      const start = clampToBounds(startValue ?? min);
+      const end = clampToBounds(endValue ?? max);
       defaultValue = [start, end];
       setDefaultRangeValue(defaultValue);
     }
@@ -126,6 +143,29 @@ export const RangeSliderV2 = ({
     setExposedVariable('reset', resetFn);
   }, [enableTwoHandle, value, min, max, startValue, endValue]);
 
+  // When the bounds move, pull the LIVE value inside them.
+  // Deliberately not the reset effect: re-running that would republish the configured default
+  useEffect(() => {
+    if (enableTwoHandle === 'slider') {
+      if (!Number.isFinite(defaultSliderValue)) return;
+      const clamped = clampToBounds(defaultSliderValue);
+      if (clamped !== defaultSliderValue) {
+        setDefaultSliderValue(clamped);
+        setExposedVariable('value', clamped);
+      }
+    } else {
+      const [start, end] = toArray(defaultRangeValue);
+      if (!Number.isFinite(start) || !Number.isFinite(end)) return;
+      const clampedStart = clampToBounds(start);
+      const clampedEnd = clampToBounds(end);
+      if (clampedStart !== start || clampedEnd !== end) {
+        setDefaultRangeValue([clampedStart, clampedEnd]);
+        setExposedVariable('value', [clampedStart, clampedEnd]);
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [min, max]);
+
   useEffect(() => {
     if (disabled !== properties.disabledState) setDisabled(properties.disabledState);
     if (visibility !== properties.visibility) setVisibility(properties.visibility);
@@ -169,6 +209,8 @@ export const RangeSliderV2 = ({
     } else {
       onRangeChange([min, min]);
     }
+    // A Form clear changes the value, so it announces it like the input widgets already do.
+    fireEvent('onChange');
   });
 
   const rangeStyles = {
@@ -280,7 +322,7 @@ export const RangeSliderV2 = ({
             direction={direction}
             widthType={widthType}
             inputId={`component-${id}`}
-            id={`${id}-label`}
+            id={labelElementId}
             fontSize={labelFontSizeValue}
           />
 
@@ -293,11 +335,11 @@ export const RangeSliderV2 = ({
                 max={max}
                 defaultValue={defaultRangeValue}
                 onChange={onRangeChange}
-                onAfterChange={() => fireEvent('onChange')}
+                onChangeComplete={() => fireEvent('onChange')}
                 value={defaultRangeValue}
                 ref={sliderRef}
                 id={`component-${id}`}
-                ariaLabelledByForHandle={`${id}-label`}
+                ariaLabelledByForHandle={labelElementId}
                 ariaLabelForHandle={!auto && labelWidth == 0 && label?.length != 0 ? label : undefined}
                 trackStyle={rangeStyles.trackStyle}
                 railStyle={rangeStyles.railStyle}
@@ -306,13 +348,18 @@ export const RangeSliderV2 = ({
                 activeDotStyle={rangeStyles.activeDotStyle}
                 marks={(Array.isArray(schema) ? schema : []).reduce((acc, item) => {
                   if (item && typeof item === 'object' && item.value !== undefined && item.label !== undefined) {
+                    const minValue = typeof min === 'number' ? min : Number(min);
                     const maxValue = typeof max === 'number' ? max : Number(max);
                     const itemValue = Number(item.value);
 
-                    if (!isNaN(maxValue) && !isNaN(itemValue) && itemValue <= maxValue) {
+                    // A mark outside the track cannot be reached, at either end.
+                    const withinMin = isNaN(minValue) || itemValue >= minValue;
+                    const withinMax = isNaN(maxValue) || itemValue <= maxValue;
+
+                    if (!isNaN(itemValue) && withinMin && withinMax) {
                       acc[item.value] = {
                         style: { color: markerLabel },
-                        label: String(item.label).replace('%', ''),
+                        label: stripPercent ? String(item.label).replace('%', '') : String(item.label),
                       };
                     }
                   }
@@ -336,10 +383,10 @@ export const RangeSliderV2 = ({
                 value={defaultSliderValue}
                 ref={sliderRef}
                 id={`component-${id}`}
-                ariaLabelledByForHandle={`${id}-label`}
+                ariaLabelledByForHandle={labelElementId}
                 ariaLabelForHandle={!auto && labelWidth == 0 && label?.length != 0 ? label : undefined}
                 onChange={onSliderChange}
-                onAfterChange={() => fireEvent('onChange')}
+                onChangeComplete={() => fireEvent('onChange')}
                 trackStyle={rangeStyles.trackStyle}
                 railStyle={rangeStyles.railStyle}
                 handleStyle={rangeStyles.handleStyle}
@@ -347,13 +394,18 @@ export const RangeSliderV2 = ({
                 activeDotStyle={rangeStyles.activeDotStyle}
                 marks={(Array.isArray(schema) ? schema : []).reduce((acc, item) => {
                   if (item && typeof item === 'object' && item.value !== undefined && item.label !== undefined) {
+                    const minValue = typeof min === 'number' ? min : Number(min);
                     const maxValue = typeof max === 'number' ? max : Number(max);
                     const itemValue = Number(item.value);
 
-                    if (!isNaN(maxValue) && !isNaN(itemValue) && itemValue <= maxValue) {
+                    // A mark outside the track cannot be reached, at either end.
+                    const withinMin = isNaN(minValue) || itemValue >= minValue;
+                    const withinMax = isNaN(maxValue) || itemValue <= maxValue;
+
+                    if (!isNaN(itemValue) && withinMin && withinMax) {
                       acc[item.value] = {
                         style: { color: markerLabel },
-                        label: String(item.label).replace('%', ''),
+                        label: stripPercent ? String(item.label).replace('%', '') : String(item.label),
                       };
                     }
                   }
@@ -363,7 +415,8 @@ export const RangeSliderV2 = ({
                 handleRender={(node, handleProps) => {
                   return (
                     <OverlayTrigger
-                      show={handleProps.dragging}
+                      // `undefined` leaves the overlay UNCONTROLLED so hover can open it;
+                      show={handleProps.dragging || undefined}
                       placement="top"
                       overlay={<Tooltip key={handleProps.value}>{handleProps.value}</Tooltip>}
                     >
